@@ -3,10 +3,12 @@
 Hourly Binance alt-coin breakout screener -> Telegram alert.
 
 Scans every actively-trading USDT spot pair on Binance, filters for
-liquidity, then deep-analyses the strongest candidates against six
-technical criteria. Sends a Telegram message ONLY when something
-qualifies (or when a scan fails), so you are not pinged 24 times a day
-with "nothing found".
+liquidity, then deep-analyses the strongest candidates and scores each
+0-100 on setup structure. Always reports the top 3, with the score
+breakdown visible so a weak field is obvious rather than hidden.
+
+The score measures how well-formed a setup is RIGHT NOW. It is not a
+prediction and carries no probability of breaking out in any timeframe.
 
 Read-only. Uses public market-data endpoints. No API keys required and
 no code path that can place an order.
@@ -17,7 +19,6 @@ Environment variables:
     BINANCE_BASE_URL     optional, default https://api.binance.com
     MIN_QUOTE_VOLUME     optional, default 2000000
     SHORTLIST_SIZE       optional, default 20
-    MIN_CRITERIA         optional, default 4
     STATE_FILE           optional, default state.json
     ALERT_COOLDOWN_HOURS optional, default 6
 """
@@ -39,7 +40,6 @@ CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 
 MIN_QUOTE_VOLUME = float(os.environ.get("MIN_QUOTE_VOLUME", 2_000_000))
 SHORTLIST_SIZE = int(os.environ.get("SHORTLIST_SIZE", 20))
-MIN_CRITERIA = int(os.environ.get("MIN_CRITERIA", 4))
 STATE_FILE = os.environ.get("STATE_FILE", "state.json")
 COOLDOWN_HOURS = float(os.environ.get("ALERT_COOLDOWN_HOURS", 6))
 
@@ -54,12 +54,6 @@ STABLE_BASES = {
 }
 LEVERAGED_MARKERS = ("UPUSDT", "DOWNUSDT", "BULLUSDT", "BEARUSDT")
 
-# Binance bStocks / Ondo tokenized equities - not crypto assets
-TOKENIZED_EQUITY = {
-    "QQQB", "METAB", "MSFTB", "PLTRB", "LITEB", "AAPLB", "TSLAB",
-    "NVDAB", "GOOGLB", "AMZNB", "SPYB", "COINB", "MSTRB", "AMDB",
-    "QQQON", "AAPLON", "GOOGLON", "TSLAON", "NVDAON", "SPYON",
-}
 
 # --------------------------------------------------------------------------
 # HTTP
@@ -114,7 +108,7 @@ def build_universe() -> list[dict]:
             continue
         base = s.get("baseAsset", "")
         sym = s["symbol"]
-        if base in STABLE_BASES or base in TOKENIZED_EQUITY or base == "BTC":
+        if base in STABLE_BASES or base == "BTC":
             continue
         if any(sym.endswith(m) for m in LEVERAGED_MARKERS):
             continue
@@ -190,6 +184,37 @@ def get_funding(symbol: str) -> float | None:
         return None  # no perpetual for this pair, or fapi unreachable
 
 
+def _clamp(x, lo=0.0, hi=1.0):
+    return max(lo, min(hi, x))
+
+
+def composite_score(contraction, dist_pct, vol_ratio, depth, low_slope, funding):
+    """Continuous 0-100 setup-quality score.
+
+    Nothing is a hard gate, so every coin gets ranked - but the volatility
+    squeeze carries the most weight, because contraction is what actually
+    precedes expansion. A high score means well-structured, not "will go up".
+    """
+    parts = {
+        # 1.0 at 0.4x contraction or tighter, 0 at 1.2x or looser
+        "squeeze": _clamp((1.20 - contraction) / 0.80),
+        # 1.0 at the resistance level, 0 at 5% below it
+        "proximity": _clamp((5.0 - dist_pct) / 5.0),
+        # 1.0 at 1.5x prior volume, 0 at 0.6x
+        "volume": _clamp((vol_ratio - 0.60) / 0.90),
+        # 1.0 at 2x bid depth, 0 at parity
+        "book": _clamp(((depth or 1.0) - 1.0) / 1.0),
+        # 1.0 when lows are rising 6% across the window
+        "structure": _clamp(low_slope / 0.06),
+        # best when funding is neutral to negative
+        "funding": 0.5 if funding is None else _clamp((0.0008 - funding) / 0.0016),
+    }
+    weights = {"squeeze": 30, "proximity": 20, "volume": 15,
+               "book": 15, "structure": 12, "funding": 8}
+    total = sum(parts[k] * weights[k] for k in weights)
+    return round(total, 1), {k: round(parts[k] * weights[k], 1) for k in weights}
+
+
 def analyse(symbol: str) -> dict | None:
     """Score one symbol against the six criteria."""
     c4 = get_klines(symbol, "4h", 90)
@@ -226,21 +251,18 @@ def analyse(symbol: str) -> dict | None:
 
     support = min(k["low"] for k in c4[-15:])
 
-    checks = {
-        "volatility squeeze": contraction < 0.70,
-        "near resistance": dist_pct <= 3.0,
-        "volume holding": vol_ratio >= 0.90,
-        "bid-heavy book": depth is not None and depth >= 1.20,
-        "higher lows": higher_lows,
-        "funding not crowded": funding is None or funding <= 0.0005,
-    }
-    score = sum(1 for v in checks.values() if v)
+    # how strongly lows are rising across the window (fractional)
+    low_slope = (lows[2] - lows[0]) / lows[0] if lows[0] > 0 else 0.0
+
+    score, parts = composite_score(contraction, dist_pct, vol_ratio,
+                                   depth, low_slope, funding)
 
     return {
         "symbol": symbol,
         "price": last,
         "score": score,
-        "checks": checks,
+        "parts": parts,
+        "higher_lows": higher_lows,
         "resistance": resistance,
         "support": support,
         "contraction": contraction,
@@ -297,25 +319,34 @@ def send_telegram(text: str) -> None:
 
 def format_alert(results: list[dict], scanned: int, passed_liquidity: int) -> str:
     stamp = datetime.now(timezone.utc).strftime("%d %b %H:%M UTC")
-    lines = [f"<b>Breakout screen</b> — {stamp}",
-             f"<i>{passed_liquidity} liquid pairs scanned, {scanned} deep-analysed</i>", ""]
+    lines = [f"<b>Top 3 setups</b> — {stamp}",
+             f"<i>{passed_liquidity} liquid pairs, {scanned} deep-analysed</i>", ""]
 
-    for r in results:
-        hit = [k for k, v in r["checks"].items() if v]
-        miss = [k for k, v in r["checks"].items() if not v]
-        lines.append(f"<b>{r['symbol']}</b>  ({r['score']}/6)")
+    for i, r in enumerate(results, 1):
+        p = r["parts"]
+        band = ("strong" if r["score"] >= 70 else
+                "moderate" if r["score"] >= 55 else
+                "weak" if r["score"] >= 40 else "poor")
+        lines.append(f"<b>{i}. {r['symbol']}</b> — {r['score']}/100 ({band})")
         lines.append(f"  price {r['price']:.6g}")
-        lines.append(f"  resistance {r['resistance']:.6g} ({r['dist_pct']:.1f}% away)")
+        lines.append(f"  trigger above {r['resistance']:.6g} "
+                     f"({r['dist_pct']:.1f}% away)")
         lines.append(f"  invalidation below {r['support']:.6g}")
-        lines.append(f"  squeeze {r['contraction']:.2f}x · vol {r['vol_ratio']:.2f}x"
-                     + (f" · book {r['depth']:.2f}" if r['depth'] else ""))
-        lines.append(f"  ✅ {', '.join(hit)}")
-        if miss:
-            lines.append(f"  ❌ {', '.join(miss)}")
+        lines.append(f"  squeeze {p['squeeze']:.0f}/30 · near {p['proximity']:.0f}/20 "
+                     f"· vol {p['volume']:.0f}/15")
+        lines.append(f"  book {p['book']:.0f}/15 · structure {p['structure']:.0f}/12 "
+                     f"· funding {p['funding']:.0f}/8")
+        lines.append(f"  <i>raw: contraction {r['contraction']:.2f}x, "
+                     f"vol {r['vol_ratio']:.2f}x"
+                     + (f", book {r['depth']:.2f}" if r['depth'] else "") + "</i>")
         lines.append("")
 
-    lines.append("<i>Technical structure only — not advice. "
-                 "Setups fail often; size and risk are your call.</i>")
+    top = results[0]["score"] if results else 0
+    if top < 55:
+        lines.append("<i>⚠️ Nothing scored well this hour — these are just the "
+                     "least-bad of a poor field.</i>")
+    lines.append("<i>Ranked by structure, not a prediction. Setups fail often. "
+                 "Sizing and risk are yours.</i>")
     return "\n".join(lines)
 
 
@@ -355,22 +386,19 @@ def main() -> int:
             print(f"  {c['symbol']}: {exc}", file=sys.stderr)
         time.sleep(0.15)  # stay well inside Binance rate limits
 
-    qualifying = [r for r in results if r["score"] >= MIN_CRITERIA]
-    qualifying.sort(key=lambda r: (r["score"], -r["dist_pct"]), reverse=True)
+    results.sort(key=lambda r: r["score"], reverse=True)
+    top3 = results[:3]
+
+    if top3:
+        send_telegram(format_alert(top3, len(results), passed_liquidity))
+        print("sent: " + ", ".join(f"{r['symbol']} {r['score']}" for r in top3))
+    else:
+        print("no analysable results")
 
     state = load_state()
     state.setdefault("alerted", {})
-    fresh = [r for r in qualifying if not on_cooldown(state, r["symbol"], now)]
-
-    if fresh:
-        top = fresh[:3]
-        send_telegram(format_alert(top, len(results), passed_liquidity))
-        for r in top:
-            state["alerted"][r["symbol"]] = now
-        print(f"alerted on: {', '.join(r['symbol'] for r in top)}")
-    else:
-        best = max((r["score"] for r in results), default=0)
-        print(f"no new qualifying setups (best score {best}/6) — no alert sent")
+    for r in top3:
+        state["alerted"][r["symbol"]] = now
 
     # prune old cooldown entries
     state["alerted"] = {
