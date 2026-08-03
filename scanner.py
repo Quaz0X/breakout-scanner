@@ -54,6 +54,12 @@ STABLE_BASES = {
 }
 LEVERAGED_MARKERS = ("UPUSDT", "DOWNUSDT", "BULLUSDT", "BEARUSDT")
 
+# Binance bStocks / Ondo tokenized equities - not crypto assets
+TOKENIZED_EQUITY = {
+    "QQQB", "METAB", "MSFTB", "PLTRB", "LITEB", "AAPLB", "TSLAB",
+    "NVDAB", "GOOGLB", "AMZNB", "SPYB", "COINB", "MSTRB", "AMDB",
+    "QQQON", "AAPLON", "GOOGLON", "TSLAON", "NVDAON", "SPYON",
+}
 
 # --------------------------------------------------------------------------
 # HTTP
@@ -108,7 +114,7 @@ def build_universe() -> list[dict]:
             continue
         base = s.get("baseAsset", "")
         sym = s["symbol"]
-        if base in STABLE_BASES or base == "BTC":
+        if base in STABLE_BASES or base in TOKENIZED_EQUITY or base == "BTC":
             continue
         if any(sym.endswith(m) for m in LEVERAGED_MARKERS):
             continue
