@@ -1,57 +1,35 @@
-name: Hourly breakout scan
+name: Intraday breakout scan
 
 on:
   schedule:
-    # Every hour, on the hour (UTC). GitHub queues these, so a few
-    # minutes of drift is normal and expected.
-    - cron: "0 * * * *"
-  workflow_dispatch:        # lets you run it manually from the Actions tab
+    # Hourly, at 7 past to avoid the top-of-hour queue crush.
+    # GitHub still drifts 5-15 min under load.
+    - cron: "7 * * * *"
+  workflow_dispatch:
 
 concurrency:
-  group: breakout-scan
-  cancel-in-progress: false
+  group: scalp-scan
+  cancel-in-progress: true      # a stale intraday scan is worthless
 
 jobs:
   scan:
     runs-on: ubuntu-latest
-    timeout-minutes: 12
-
+    timeout-minutes: 10
     steps:
-      - name: Check out repo
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-
-      - name: Install dependencies
-        run: pip install requests
-
-      # Carries the "already alerted" state between runs so you don't get
-      # pinged about the same coin every single hour.
-      - name: Restore state
-        uses: actions/cache/restore@v4
-        with:
-          path: state.json
-          key: scan-state-${{ github.run_id }}
-          restore-keys: |
-            scan-state-
-
+      - run: pip install requests
       - name: Run scan
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           BINANCE_BASE_URL: ${{ vars.BINANCE_BASE_URL || 'https://api.binance.com' }}
-          MIN_QUOTE_VOLUME: "2000000"
-          SHORTLIST_SIZE: "20"
-          MIN_CRITERIA: "4"
-          ALERT_COOLDOWN_HOURS: "6"
+          MIN_QUOTE_VOLUME: "10000000"
+          MAX_SPREAD_PCT: "0.12"
+          MIN_COST_EDGE: "4.0"
+          TAKER_FEE_PCT: "0.10"
+          HOLD_CANDLES: "12"
+          SHORTLIST_SIZE: "25"
         run: python scanner.py
-
-      - name: Save state
-        if: always()
-        uses: actions/cache/save@v4
-        with:
-          path: state.json
-          key: scan-state-${{ github.run_id }}
