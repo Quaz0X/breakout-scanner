@@ -54,6 +54,17 @@ STABLE_BASES = {
 }
 LEVERAGED_MARKERS = ("UPUSDT", "DOWNUSDT", "BULLUSDT", "BEARUSDT")
 
+# Binance bStocks / Ondo tokenized equities. These track real-world shares
+# and ETFs, not crypto assets - their volume and order books are driven by
+# fee promotions and equity-market hours, so they distort a crypto screen.
+TOKENIZED_EQUITY = {
+    "QQQB", "METAB", "MSFTB", "PLTRB", "LITEB", "AAPLB", "TSLAB",
+    "NVDAB", "GOOGLB", "AMZNB", "SPYB", "COINB", "MSTRB", "AMDB",
+    "NFLXB", "AVGOB", "CRCLB", "HOODB", "IBITB",
+    "QQQON", "AAPLON", "GOOGLON", "TSLAON", "NVDAON", "SPYON",
+    "METAON", "MSFTON", "AMZNON", "COINON", "MSTRON",
+}
+
 
 # --------------------------------------------------------------------------
 # HTTP
@@ -108,7 +119,13 @@ def build_universe() -> list[dict]:
             continue
         base = s.get("baseAsset", "")
         sym = s["symbol"]
-        if base in STABLE_BASES or base == "BTC":
+        if base in STABLE_BASES or base in TOKENIZED_EQUITY or base == "BTC":
+            continue
+        # catch-all for bStocks (…B) / Ondo (…ON) equity tokens added later
+        if base.endswith("ON") and base[:-2] in {
+            "QQQ", "SPY", "AAPL", "GOOGL", "TSLA", "NVDA", "META",
+            "MSFT", "AMZN", "COIN", "MSTR",
+        }:
             continue
         if any(sym.endswith(m) for m in LEVERAGED_MARKERS):
             continue
