@@ -247,8 +247,20 @@ def analyse(symbol: str) -> dict | None:
     contraction = (r_recent / r_prior) if r_prior > 0 else 99.0
 
     # 2. proximity to resistance
-    resistance = max(k["high"] for k in c4[-15:])
+    # Resistance must be a level price FAILED at before the current move,
+    # not a high made during it. Using c4[-15:] would mean any coin in a
+    # daily uptrend is "at resistance" by definition - the level would be
+    # drawn under its own feet. So look back further and exclude the
+    # recent window entirely.
+    prior_window = c4[-40:-15]
+    resistance = max(k["high"] for k in prior_window)
     dist_pct = (resistance - last) / last * 100
+
+    # If price is already ABOVE that old level, the breakout has happened -
+    # this is no longer a pre-breakout setup, so proximity earns nothing.
+    already_broken = dist_pct < 0
+    if already_broken:
+        dist_pct = 99.0
 
     # 3. volume holding up
     v_recent = sum(k["volume"] for k in recent) / len(recent)
@@ -281,6 +293,7 @@ def analyse(symbol: str) -> dict | None:
         "parts": parts,
         "higher_lows": higher_lows,
         "resistance": resistance,
+        "already_broken": already_broken,
         "support": support,
         "contraction": contraction,
         "dist_pct": dist_pct,
@@ -346,8 +359,12 @@ def format_alert(results: list[dict], scanned: int, passed_liquidity: int) -> st
                 "weak" if r["score"] >= 40 else "poor")
         lines.append(f"<b>{i}. {r['symbol']}</b> — {r['score']}/100 ({band})")
         lines.append(f"  price {r['price']:.6g}")
-        lines.append(f"  trigger above {r['resistance']:.6g} "
-                     f"({r['dist_pct']:.1f}% away)")
+        if r.get("already_broken"):
+            lines.append(f"  ⚠️ already above prior level {r['resistance']:.6g} "
+                         f"— move underway, not a pre-breakout setup")
+        else:
+            lines.append(f"  trigger above {r['resistance']:.6g} "
+                         f"({r['dist_pct']:.1f}% away)")
         lines.append(f"  invalidation below {r['support']:.6g}")
         lines.append(f"  squeeze {p['squeeze']:.0f}/30 · near {p['proximity']:.0f}/20 "
                      f"· vol {p['volume']:.0f}/15")
