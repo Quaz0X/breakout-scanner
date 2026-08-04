@@ -52,15 +52,29 @@ STABLE_BASES = {
     "USDC", "FDUSD", "TUSD", "BUSD", "DAI", "USDP", "EUR", "GBP", "AEUR",
     "USD1", "PYUSD", "EURI", "XUSD", "USDE",
 }
+# Add more via repo variable EXTRA_EXCLUDE="FOOB,BARB" if Binance lists
+# new tokenized equities before this file is updated.
+EXTRA_EXCLUDE = {
+    s.strip().upper() for s in os.environ.get("EXTRA_EXCLUDE", "").split(",")
+    if s.strip()
+}
+
 LEVERAGED_MARKERS = ("UPUSDT", "DOWNUSDT", "BULLUSDT", "BEARUSDT")
 
 # Binance bStocks / Ondo tokenized equities. These track real-world shares
 # and ETFs, not crypto assets - their volume and order books are driven by
 # fee promotions and equity-market hours, so they distort a crypto screen.
 TOKENIZED_EQUITY = {
-    "QQQB", "METAB", "MSFTB", "PLTRB", "LITEB", "AAPLB", "TSLAB",
-    "NVDAB", "GOOGLB", "AMZNB", "SPYB", "COINB", "MSTRB", "AMDB",
-    "NFLXB", "AVGOB", "CRCLB", "HOODB", "IBITB",
+    # Binance bStocks - tokenized US equities and ETFs. Ticker + "B".
+    # Built from the live USDT listing; extend via EXTRA_EXCLUDE env var.
+    "AAOIB", "AAPLB", "AMATB", "AMDB", "AMZNB", "ARMB", "AVGOB", "AXTIB",
+    "BABAB", "CBRSB", "COINB", "CRCLB", "CRWVB", "DELLB", "DRAMB", "EWYB",
+    "FLNCB", "GLWB", "GOOGLB", "GSB", "HOODB", "IBMB", "INTCB", "INTWB",
+    "KORUB", "LITEB", "METAB", "MRVLB", "MSFTB", "MSTRB", "MVLLB", "NBISB",
+    "NOKB", "NVDAB", "ORCLB", "PLTRB", "PYPLB", "QCOMB", "QNTB", "QQQB",
+    "RKLBB", "SKHYB", "SMHB", "SNDKB", "SNXXB", "SOXLB", "SOXSB", "SPCXB",
+    "SPYB", "TQQQB", "TSLAB", "TSMB", "WDCB",
+    # Ondo-issued tokenized equities
     "QQQON", "AAPLON", "GOOGLON", "TSLAON", "NVDAON", "SPYON",
     "METAON", "MSFTON", "AMZNON", "COINON", "MSTRON",
 }
@@ -119,7 +133,7 @@ def build_universe() -> list[dict]:
             continue
         base = s.get("baseAsset", "")
         sym = s["symbol"]
-        if base in STABLE_BASES or base in TOKENIZED_EQUITY or base == "BTC":
+        if base in STABLE_BASES or base in TOKENIZED_EQUITY or base in EXTRA_EXCLUDE or base == "BTC":
             continue
         # catch-all for bStocks (…B) / Ondo (…ON) equity tokens added later
         if base.endswith("ON") and base[:-2] in {
@@ -290,17 +304,23 @@ def _clamp(x, lo=0.0, hi=1.0):
 
 
 def composite_score(contraction, dist_pct, vol_ratio, depth, low_slope,
-                    funding, cvd_share, cvd_divergence, thinness):
+                    funding, cvd_share, cvd_divergence, thinness,
+                    already_broken=False):
     """Continuous 0-100 setup-quality score.
 
     Nothing is a hard gate, so every coin gets ranked - but the volatility
     squeeze carries the most weight, because contraction is what actually
     precedes expansion. A high score means well-structured, not "will go up".
     """
-    # CVD: reward net aggressive buying; bonus when it builds on flat price
+    # CVD: reward net aggressive buying; bonus when it builds on flat price.
+    # Critically, a CVD reading computed on very thin volume is noise - a
+    # +24% delta across a handful of trades means nothing. Scale confidence
+    # by how much volume actually traded.
     cvd_base = _clamp((cvd_share + 0.05) / 0.20)
     if cvd_divergence:
         cvd_base = min(1.0, cvd_base + 0.25)
+    cvd_confidence = _clamp(vol_ratio / 0.80)
+    cvd_base *= cvd_confidence
 
     parts = {
         # 1.0 at 0.4x contraction or tighter, 0 at 1.2x or looser
@@ -323,6 +343,13 @@ def composite_score(contraction, dist_pct, vol_ratio, depth, low_slope,
     weights = {"squeeze": 25, "cvd": 15, "proximity": 15, "thinness": 10,
                "volume": 10, "book": 10, "structure": 10, "funding": 5}
     total = sum(parts[k] * weights[k] for k in weights)
+
+    # A coin already above its prior level is not a pre-breakout candidate.
+    # Zeroing proximity alone wasn't enough - it could still outrank a real
+    # setup on the other components. Apply a haircut so genuine coils win.
+    if already_broken:
+        total *= 0.70
+
     return round(total, 1), {k: round(parts[k] * weights[k], 1) for k in weights}
 
 
@@ -382,7 +409,8 @@ def analyse(symbol: str) -> dict | None:
 
     score, parts = composite_score(contraction, dist_pct, vol_ratio,
                                    depth, low_slope, funding,
-                                   cvd_share, cvd_divergence, thinness)
+                                   cvd_share, cvd_divergence, thinness,
+                                   already_broken)
 
     return {
         "symbol": symbol,
