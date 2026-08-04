@@ -2,34 +2,53 @@ name: Intraday breakout scan
 
 on:
   schedule:
-    # Hourly, at 7 past to avoid the top-of-hour queue crush.
-    # GitHub still drifts 5-15 min under load.
-    - cron: "7 * * * *"
-  workflow_dispatch:
+    # Top of every hour. This is the cadence that was working before -
+    # do not change it while diagnosing scheduling problems.
+    - cron: "0 * * * *"
+  workflow_dispatch:        # manual run from the Actions tab
 
 concurrency:
-  group: scalp-scan
-  cancel-in-progress: true      # a stale intraday scan is worthless
+  group: breakout-scan
+  # MUST stay false. With cancel-in-progress: true, any manual run you
+  # trigger also kills scheduled runs sitting in GitHub's queue - and
+  # scheduled runs queue routinely under load. That is what was eating
+  # the hourly runs.
+  cancel-in-progress: false
 
 jobs:
   scan:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 12
+
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: pip install requests
+
+      - name: Install dependencies
+        run: pip install requests
+
       - name: Run scan
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           BINANCE_BASE_URL: ${{ vars.BINANCE_BASE_URL || 'https://api.binance.com' }}
-          MIN_QUOTE_VOLUME: "10000000"
-          MAX_SPREAD_PCT: "0.12"
-          MIN_COST_EDGE: "4.0"
+
+          # --- liquidity and cost gates -------------------------------
+          MIN_QUOTE_VOLUME: "10000000"   # min 24h volume in USDT
+          MAX_SPREAD_PCT: "0.12"         # reject anything wider
+          MIN_COST_EDGE: "4.0"           # expected move / round-trip cost
+
+          # Set to 0.075 if you pay fees in BNB, lower still for VIP tiers.
+          # Several coins are currently rejected at 3.5-3.9x and would
+          # qualify at a lower fee assumption.
           TAKER_FEE_PCT: "0.10"
+
+          # 12 x 15m = 3 hour expected hold
           HOLD_CANDLES: "12"
           SHORTLIST_SIZE: "25"
         run: python scanner.py
