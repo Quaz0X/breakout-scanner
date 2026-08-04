@@ -48,6 +48,11 @@ SESSION = requests.Session()
 SESSION.headers.update({"User-Agent": "breakout-screener/1.0"})
 
 # Excluded from the universe -----------------------------------------------
+# Commodity-backed tokens. XAUT/PAXG track physical gold; their price
+# action is the gold market, not crypto, so they distort a crypto screen
+# exactly the way tokenized equities did.
+COMMODITY_BACKED = {"XAUT", "PAXG", "XAUTUSDT", "KAU", "TXAU", "XAGX"}
+
 STABLE_BASES = {
     "USDC", "FDUSD", "TUSD", "BUSD", "DAI", "USDP", "EUR", "GBP", "AEUR",
     "USD1", "PYUSD", "EURI", "XUSD", "USDE",
@@ -133,7 +138,9 @@ def build_universe() -> list[dict]:
             continue
         base = s.get("baseAsset", "")
         sym = s["symbol"]
-        if base in STABLE_BASES or base in TOKENIZED_EQUITY or base in EXTRA_EXCLUDE or base == "BTC":
+        if (base in STABLE_BASES or base in TOKENIZED_EQUITY
+                or base in COMMODITY_BACKED or base in EXTRA_EXCLUDE
+                or base == "BTC"):
             continue
         # catch-all for bStocks (…B) / Ondo (…ON) equity tokens added later
         if base.endswith("ON") and base[:-2] in {
@@ -284,18 +291,25 @@ def volume_profile(candles, resistance, bins=30):
     poc_idx = max(range(bins), key=lambda i: buckets[i])
     poc_price = lo + (poc_idx + 0.5) * width
 
-    avg = sum(buckets) / bins
-    if avg <= 0:
+    if sum(buckets) <= 0:
         return poc_price, 0.5
 
-    # volume sitting AT the resistance level
+    # volume sitting AT the resistance level (the shelf, not one bin)
     r_idx = max(0, min(int((resistance - lo) / width), bins - 1))
-    # average the level and its immediate neighbours - the shelf, not one bin
     window = buckets[max(0, r_idx - 1):min(bins, r_idx + 2)]
-    density = (sum(window) / len(window)) / avg
+    density = sum(window) / len(window)
 
-    # density 0.5x avg or below -> thin (1.0); 1.5x or above -> thick (0.0)
-    thinness = max(0.0, min(1.0, (1.5 - density) / 1.0))
+    # PERCENTILE rank, not ratio-to-mean. Comparing against the mean made
+    # this metric max out on nearly every coin: the shortlist only takes
+    # coins in the upper half of their range, so they sit above their POC
+    # by construction and any level above them looks "thin". Ranking the
+    # resistance bin against every other bin normalises that away and
+    # actually discriminates.
+    below = sum(1 for b in buckets if b < density)
+    pct_rank = below / bins          # 0 = emptiest bin, 1 = the POC
+
+    # Full marks only in the bottom quartile; zero at or above median.
+    thinness = max(0.0, min(1.0, (0.50 - pct_rank) / 0.25))
     return poc_price, thinness
 
 
