@@ -180,6 +180,9 @@ def get_klines(symbol: str, interval: str, limit: int) -> list[dict]:
     return [{
         "open": float(k[1]), "high": float(k[2]), "low": float(k[3]),
         "close": float(k[4]), "volume": float(k[5]),
+        # field 9 is taker BUY base volume - the aggressive-buy share of
+        # this candle. Binance already sends it; we were discarding it.
+        "taker_buy": float(k[9]),
     } for k in raw]
 
 
@@ -201,22 +204,113 @@ def get_funding(symbol: str) -> float | None:
         return None  # no perpetual for this pair, or fapi unreachable
 
 
+def cvd_metrics(candles):
+    """Cumulative Volume Delta from taker-buy share.
+
+    delta = taker_buy - taker_sell = 2*taker_buy - total_volume
+    Positive delta means aggressive buyers lifted more than sellers hit.
+
+    Returns (net_delta_share, divergence) where:
+      net_delta_share - recent net delta as a fraction of recent volume,
+                        roughly -1..+1
+      divergence      - buying pressure building while price goes nowhere
+                        or down. This is the accumulation signature: it
+                        separates "quiet because nobody cares" from
+                        "quiet because someone is absorbing supply".
+    """
+    recent = candles[-6:]
+    vol = sum(k["volume"] for k in recent)
+    delta = sum(2 * k["taker_buy"] - k["volume"] for k in recent)
+    net_share = (delta / vol) if vol > 0 else 0.0
+
+    # price change over the same window
+    px_chg = ((recent[-1]["close"] - recent[0]["open"]) / recent[0]["open"]
+              if recent[0]["open"] > 0 else 0.0)
+
+    # buying pressure with flat-or-down price = absorption
+    divergence = net_share > 0.02 and px_chg <= 0.005
+    return net_share, divergence
+
+
+def volume_profile(candles, resistance, bins=30):
+    """APPROXIMATED volume profile from candles.
+
+    True VPVR needs trade-level data. This distributes each candle's volume
+    evenly across its high-low range, which is an estimate - it assumes
+    uniform trading through the candle, which is never exactly true.
+
+    What it answers usefully: is the resistance level sitting on a THICK
+    volume shelf (lots of prior trade there, hard to push through) or a
+    THIN one (little prior interest, price can move fast)?
+
+    Returns (poc_price, thinness) where thinness is 0..1 -
+    higher means less volume parked at the resistance level.
+    """
+    lo = min(k["low"] for k in candles)
+    hi = max(k["high"] for k in candles)
+    if hi <= lo:
+        return None, 0.5
+
+    width = (hi - lo) / bins
+    buckets = [0.0] * bins
+
+    for k in candles:
+        k_lo, k_hi = k["low"], k["high"]
+        if k_hi <= k_lo:
+            idx = min(int((k_lo - lo) / width), bins - 1)
+            buckets[idx] += k["volume"]
+            continue
+        first = max(0, min(int((k_lo - lo) / width), bins - 1))
+        last = max(0, min(int((k_hi - lo) / width), bins - 1))
+        span = last - first + 1
+        share = k["volume"] / span
+        for i in range(first, last + 1):
+            buckets[i] += share
+
+    poc_idx = max(range(bins), key=lambda i: buckets[i])
+    poc_price = lo + (poc_idx + 0.5) * width
+
+    avg = sum(buckets) / bins
+    if avg <= 0:
+        return poc_price, 0.5
+
+    # volume sitting AT the resistance level
+    r_idx = max(0, min(int((resistance - lo) / width), bins - 1))
+    # average the level and its immediate neighbours - the shelf, not one bin
+    window = buckets[max(0, r_idx - 1):min(bins, r_idx + 2)]
+    density = (sum(window) / len(window)) / avg
+
+    # density 0.5x avg or below -> thin (1.0); 1.5x or above -> thick (0.0)
+    thinness = max(0.0, min(1.0, (1.5 - density) / 1.0))
+    return poc_price, thinness
+
+
 def _clamp(x, lo=0.0, hi=1.0):
     return max(lo, min(hi, x))
 
 
-def composite_score(contraction, dist_pct, vol_ratio, depth, low_slope, funding):
+def composite_score(contraction, dist_pct, vol_ratio, depth, low_slope,
+                    funding, cvd_share, cvd_divergence, thinness):
     """Continuous 0-100 setup-quality score.
 
     Nothing is a hard gate, so every coin gets ranked - but the volatility
     squeeze carries the most weight, because contraction is what actually
     precedes expansion. A high score means well-structured, not "will go up".
     """
+    # CVD: reward net aggressive buying; bonus when it builds on flat price
+    cvd_base = _clamp((cvd_share + 0.05) / 0.20)
+    if cvd_divergence:
+        cvd_base = min(1.0, cvd_base + 0.25)
+
     parts = {
         # 1.0 at 0.4x contraction or tighter, 0 at 1.2x or looser
         "squeeze": _clamp((1.20 - contraction) / 0.80),
+        # aggressive buy/sell imbalance, +0.25 bonus for accumulation shape
+        "cvd": cvd_base,
         # 1.0 at the resistance level, 0 at 5% below it
         "proximity": _clamp((5.0 - dist_pct) / 5.0),
+        # thin volume shelf at resistance = easier to break through
+        "thinness": _clamp(thinness),
         # 1.0 at 1.5x prior volume, 0 at 0.6x
         "volume": _clamp((vol_ratio - 0.60) / 0.90),
         # 1.0 at 2x bid depth, 0 at parity
@@ -226,8 +320,8 @@ def composite_score(contraction, dist_pct, vol_ratio, depth, low_slope, funding)
         # best when funding is neutral to negative
         "funding": 0.5 if funding is None else _clamp((0.0008 - funding) / 0.0016),
     }
-    weights = {"squeeze": 30, "proximity": 20, "volume": 15,
-               "book": 15, "structure": 12, "funding": 8}
+    weights = {"squeeze": 25, "cvd": 15, "proximity": 15, "thinness": 10,
+               "volume": 10, "book": 10, "structure": 10, "funding": 5}
     total = sum(parts[k] * weights[k] for k in weights)
     return round(total, 1), {k: round(parts[k] * weights[k], 1) for k in weights}
 
@@ -283,8 +377,12 @@ def analyse(symbol: str) -> dict | None:
     # how strongly lows are rising across the window (fractional)
     low_slope = (lows[2] - lows[0]) / lows[0] if lows[0] > 0 else 0.0
 
+    cvd_share, cvd_divergence = cvd_metrics(c4)
+    poc_price, thinness = volume_profile(c4, resistance)
+
     score, parts = composite_score(contraction, dist_pct, vol_ratio,
-                                   depth, low_slope, funding)
+                                   depth, low_slope, funding,
+                                   cvd_share, cvd_divergence, thinness)
 
     return {
         "symbol": symbol,
@@ -294,6 +392,10 @@ def analyse(symbol: str) -> dict | None:
         "higher_lows": higher_lows,
         "resistance": resistance,
         "already_broken": already_broken,
+        "cvd_share": cvd_share,
+        "cvd_divergence": cvd_divergence,
+        "poc": poc_price,
+        "thinness": thinness,
         "support": support,
         "contraction": contraction,
         "dist_pct": dist_pct,
@@ -366,21 +468,27 @@ def format_alert(results: list[dict], scanned: int, passed_liquidity: int) -> st
             lines.append(f"  trigger above {r['resistance']:.6g} "
                          f"({r['dist_pct']:.1f}% away)")
         lines.append(f"  invalidation below {r['support']:.6g}")
-        lines.append(f"  squeeze {p['squeeze']:.0f}/30 · near {p['proximity']:.0f}/20 "
-                     f"· vol {p['volume']:.0f}/15")
-        lines.append(f"  book {p['book']:.0f}/15 · structure {p['structure']:.0f}/12 "
-                     f"· funding {p['funding']:.0f}/8")
+        lines.append(f"  squeeze {p['squeeze']:.0f}/25 · cvd {p['cvd']:.0f}/15 "
+                     f"· near {p['proximity']:.0f}/15")
+        lines.append(f"  thin {p['thinness']:.0f}/10 · vol {p['volume']:.0f}/10 "
+                     f"· book {p['book']:.0f}/10")
+        lines.append(f"  structure {p['structure']:.0f}/10 · funding {p['funding']:.0f}/5")
+        if r.get("cvd_divergence"):
+            lines.append("  🔵 buying pressure building on flat price "
+                         "(absorption)")
         lines.append(f"  <i>raw: contraction {r['contraction']:.2f}x, "
-                     f"vol {r['vol_ratio']:.2f}x"
-                     + (f", book {r['depth']:.2f}" if r['depth'] else "") + "</i>")
+                     f"vol {r['vol_ratio']:.2f}x, cvd {r['cvd_share']:+.1%}"
+                     + (f", book {r['depth']:.2f}" if r['depth'] else "")
+                     + (f", POC {r['poc']:.6g}" if r.get('poc') else "") + "</i>")
         lines.append("")
 
     top = results[0]["score"] if results else 0
     if top < 55:
         lines.append("<i>⚠️ Nothing scored well this hour — these are just the "
                      "least-bad of a poor field.</i>")
-    lines.append("<i>Ranked by structure, not a prediction. Setups fail often. "
-                 "Sizing and risk are yours.</i>")
+    lines.append("<i>Volume profile is approximated from candles, not "
+                 "trade-level data. Ranked by structure, not a prediction. "
+                 "Setups fail often. Sizing and risk are yours.</i>")
     return "\n".join(lines)
 
 
