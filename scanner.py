@@ -359,6 +359,9 @@ def format_alert(results, deep, liquid):
                  f"· rvol {p['rvol']:.0f}/16")
         L.append(f"  cvd {p['cvd']:.0f}/16 · cost {p['cost_edge']:.0f}/12 "
                  f"· book {p['book']:.0f}/9 · fund {p['funding']:.0f}/5")
+        if not r.get("tradeable", True):
+            L.append(f"  🚫 NOT TRADEABLE — cost edge {r['cost_edge']:.1f}x "
+                     f"is below the {MIN_COST_EDGE}x floor; costs eat the move")
         if r["absorption"]:
             L.append("  🔵 buying absorbed on flat price")
         L.append(f"  <i>ATR {r['atr_pct']:.2f}%/15m · exp move ~{r['expected_move']:.2f}% "
@@ -391,18 +394,24 @@ def main():
     picks = shortlist(universe)
     print(f"{liquid} passed liquidity+spread, {len(picks)} shortlisted")
     if not picks:
-        print("nothing in the upper half of range")
+        send_telegram(
+            "\u26a0\ufe0f <b>Scan ran \u2014 quiet market</b>\n"
+            f"{liquid} pairs passed liquidity+spread, but none are in the "
+            "upper half of their 24h range. Nothing setting up. "
+            "This is a real result, not a failure.")
+        print("nothing in the upper half of range - sent status message")
         return 0
 
     results = []
     for c in picks:
         try:
             r = analyse(c["symbol"], c["spread_pct"], c["quote_volume"])
-            if r and r["cost_edge"] >= MIN_COST_EDGE:
+            if r:
+                # Keep everything and mark viability rather than dropping it.
+                # Silently sending nothing looks identical to a broken cron,
+                # so the alert always goes out and says what it found.
+                r["tradeable"] = r["cost_edge"] >= MIN_COST_EDGE
                 results.append(r)
-            elif r:
-                print(f"  {c['symbol']}: cost edge {r['cost_edge']:.1f}x "
-                      f"below floor {MIN_COST_EDGE} — not tradeable")
         except GeoBlocked as exc:
             send_telegram(f"⚠️ <b>Scan blocked</b>\n{exc}")
             return 2
@@ -411,10 +420,15 @@ def main():
         time.sleep(0.12)
 
     if not results:
-        print("no pairs cleared the cost-edge floor — no alert")
+        send_telegram(f"⚠️ <b>Scan ran, nothing analysable</b>\n"
+                      f"{liquid} pairs passed liquidity+spread but none "
+                      f"returned usable candles. Not a crash — check the "
+                      f"Actions log if this repeats.")
+        print("no analysable results")
         return 0
 
-    results.sort(key=lambda r: r["score"], reverse=True)
+    # tradeable setups rank above untradeable ones at any score
+    results.sort(key=lambda r: (r["tradeable"], r["score"]), reverse=True)
     send_telegram(format_alert(results[:3], len(results), liquid))
     print("sent: " + ", ".join(f"{r['symbol']} {r['score']}" for r in results[:3]))
     return 0
