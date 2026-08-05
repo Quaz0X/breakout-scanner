@@ -23,6 +23,9 @@ Environment variables:
     MIN_QUOTE_VOLUME      optional, default 10000000
     MAX_SPREAD_PCT        optional, default 0.12
     MIN_COST_EDGE         optional, default 4.0
+    MAX_RISK_PCT          optional, default 4.0   (max stop distance)
+    MIN_NEAR_DEPTH        optional, default 25000 (bid depth within 0.5%)
+    MAX_ATR_PCT           optional, default 3.0   (per-15m volatility cap)
     SHORTLIST_SIZE        optional, default 25
     TAKER_FEE_PCT         optional, default 0.10
     HOLD_CANDLES          optional, default 12 (12 x 15m = 3h hold)
@@ -46,6 +49,14 @@ CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 MIN_QUOTE_VOLUME = float(os.environ.get("MIN_QUOTE_VOLUME", 10_000_000))
 MAX_SPREAD_PCT = float(os.environ.get("MAX_SPREAD_PCT", 0.12))
 MIN_COST_EDGE = float(os.environ.get("MIN_COST_EDGE", 4.0))
+# Max distance to the stop. A 19% stop is incompatible with a 30min-4hr
+# hold no matter how good the structure looks.
+MAX_RISK_PCT = float(os.environ.get("MAX_RISK_PCT", 4.0))
+# Minimum resting bid depth within 0.5% of price. Below this you cannot
+# exit a position without moving the market against yourself.
+MIN_NEAR_DEPTH = float(os.environ.get("MIN_NEAR_DEPTH", 25_000))
+# Ceiling on per-candle volatility. Above this it is chaos, not opportunity.
+MAX_ATR_PCT = float(os.environ.get("MAX_ATR_PCT", 3.0))
 SHORTLIST_SIZE = int(os.environ.get("SHORTLIST_SIZE", 25))
 TAKER_FEE_PCT = float(os.environ.get("TAKER_FEE_PCT", 0.10))
 # how many 15m candles you expect to hold - 12 = 3 hours
@@ -252,6 +263,13 @@ def analyse(symbol, spread_pct, quote_volume):
     atr = sum(trs[-14:]) / 14
     atr_pct = atr / last * 100
 
+    # Fetch the book FIRST. The universe-level spread came from the 24h
+    # ticker and can be badly stale - HEI passed a 0.12% gate while its
+    # live spread was 0.154%. Cost must be computed from the live figure.
+    book_ratio, near_depth, live_spread = get_book(symbol)
+    if live_spread is not None and live_spread > 0:
+        spread_pct = live_spread
+
     # --- COST EDGE: expected move vs what it costs to round-trip -------
     # This is the metric that decides whether a scalp is even viable.
     # Round trip = spread crossed twice + taker fee both sides.
@@ -278,7 +296,6 @@ def analyse(symbol, spread_pct, quote_volume):
               if seg[0]["open"] > 0 else 0.0)
     absorption = cvd_share > 0.03 and px_chg <= 0.003
 
-    book_ratio, near_depth, live_spread = get_book(symbol)
     funding = get_funding(symbol)
 
     # --- score ----------------------------------------------------------
@@ -296,19 +313,45 @@ def analyse(symbol, spread_pct, quote_volume):
         # activity building now. 1.0 at 2x, 0 at 0.7x
         "rvol": _clamp((rvol - 0.70) / 1.30),
         "cvd": cvd_part,
-        # is the move worth the cost? 1.0 at 10x, 0 at MIN_COST_EDGE
+        # Is the move worth the cost? Saturates at 10x - beyond that the
+        # extra "edge" is just volatility, and volatility is not free.
+        # HEI scored full marks at 64x purely because its ATR was 5.6%
+        # per candle, which is chaos rather than opportunity.
         "cost_edge": _clamp((cost_edge - MIN_COST_EDGE) / (10.0 - MIN_COST_EDGE)),
         "book": _clamp(((book_ratio or 1.0) - 1.0) / 1.0),
         "funding": 0.5 if funding is None else _clamp((0.0006 - funding) / 0.0012),
     }
-    weights = {"squeeze": 24, "proximity": 18, "rvol": 16, "cvd": 16,
-               "cost_edge": 12, "book": 9, "funding": 5}
+    # Reward a stop you can actually place. Full marks at 1.5% or tighter,
+    # zero at MAX_RISK_PCT. A 19% stop is not a scalp.
+    risk_now = abs(last - support) / last * 100 if last > 0 else 99.0
+    parts["tightness"] = _clamp((MAX_RISK_PCT - risk_now) / (MAX_RISK_PCT - 1.5))
+
+    weights = {"squeeze": 21, "proximity": 16, "rvol": 14, "cvd": 14,
+               "cost_edge": 10, "tightness": 12, "book": 8, "funding": 5}
     total = sum(parts[k] * weights[k] for k in weights)
     if already_broken:
         total *= 0.70
 
+    # --- HARD TRADEABILITY GATES ---------------------------------------
+    # Structure score is meaningless if you cannot actually take the trade.
+    # Each of these disqualifies regardless of how good the setup looks.
+    risk_pct = abs(last - support) / last * 100 if last > 0 else 99.0
+
+    blockers = []
+    if cost_edge < MIN_COST_EDGE:
+        blockers.append(f"cost edge {cost_edge:.1f}x < {MIN_COST_EDGE}x")
+    if risk_pct > MAX_RISK_PCT:
+        blockers.append(f"stop {risk_pct:.1f}% away > {MAX_RISK_PCT}%")
+    if near_depth is not None and near_depth < MIN_NEAR_DEPTH:
+        blockers.append(f"depth ${near_depth:,.0f} < ${MIN_NEAR_DEPTH:,.0f}")
+    if atr_pct > MAX_ATR_PCT:
+        blockers.append(f"ATR {atr_pct:.1f}%/15m > {MAX_ATR_PCT}%")
+    if spread_pct > MAX_SPREAD_PCT:
+        blockers.append(f"live spread {spread_pct:.3f}% > {MAX_SPREAD_PCT}%")
+
     return {
         "symbol": symbol, "price": last, "score": round(total, 1),
+        "risk_pct": risk_pct, "blockers": blockers,
         "parts": {k: round(parts[k] * weights[k], 1) for k in weights},
         "resistance": resistance, "support": support,
         "already_broken": already_broken, "dist_pct": dist_pct,
@@ -359,14 +402,13 @@ def format_alert(results, deep, liquid):
                  f"· rvol {p['rvol']:.0f}/16")
         L.append(f"  cvd {p['cvd']:.0f}/16 · cost {p['cost_edge']:.0f}/12 "
                  f"· book {p['book']:.0f}/9 · fund {p['funding']:.0f}/5")
-        if not r.get("tradeable", True):
-            L.append(f"  🚫 NOT TRADEABLE — cost edge {r['cost_edge']:.1f}x "
-                     f"is below the {MIN_COST_EDGE}x floor; costs eat the move")
+        if r.get("blockers"):
+            L.append("  🚫 NOT TRADEABLE — " + "; ".join(r["blockers"]))
         if r["absorption"]:
             L.append("  🔵 buying absorbed on flat price")
         L.append(f"  <i>ATR {r['atr_pct']:.2f}%/15m · exp move ~{r['expected_move']:.2f}% "
                  f"· cost {r['round_trip']:.2f}% · edge {r['cost_edge']:.1f}x</i>")
-        L.append(f"  <i>spread {r['spread_pct']:.3f}% · rvol {r['rvol']:.2f}x "
+        L.append(f"  <i>spread {r['spread_pct']:.3f}% (live) · rvol {r['rvol']:.2f}x "
                  f"· cvd {r['cvd_share']:+.1%}</i>")
         if r["near_depth"]:
             L.append(f"  <i>bid depth within 0.5%: ${r['near_depth']:,.0f}</i>")
