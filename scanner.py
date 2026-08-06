@@ -398,10 +398,10 @@ def format_alert(results, deep, liquid):
             L.append(f"  trigger {r['resistance']:.6g} ({r['dist_pct']:.2f}% away)")
         L.append(f"  stop below {r['support']:.6g} "
                  f"(risk {abs(r['price']-r['support'])/r['price']*100:.2f}%)")
-        L.append(f"  squeeze {p['squeeze']:.0f}/24 · near {p['proximity']:.0f}/18 "
-                 f"· rvol {p['rvol']:.0f}/16")
-        L.append(f"  cvd {p['cvd']:.0f}/16 · cost {p['cost_edge']:.0f}/12 "
-                 f"· book {p['book']:.0f}/9 · fund {p['funding']:.0f}/5")
+        L.append(f"  squeeze {p['squeeze']:.0f}/21 · near {p['proximity']:.0f}/16 "
+                 f"· rvol {p['rvol']:.0f}/14 · cvd {p['cvd']:.0f}/14")
+        L.append(f"  tight {p['tightness']:.0f}/12 · cost {p['cost_edge']:.0f}/10 "
+                 f"· book {p['book']:.0f}/8 · fund {p['funding']:.0f}/5")
         if r.get("blockers"):
             L.append("  🚫 NOT TRADEABLE — " + "; ".join(r["blockers"]))
         if r["absorption"]:
@@ -452,7 +452,7 @@ def main():
                 # Keep everything and mark viability rather than dropping it.
                 # Silently sending nothing looks identical to a broken cron,
                 # so the alert always goes out and says what it found.
-                r["tradeable"] = r["cost_edge"] >= MIN_COST_EDGE
+                r["tradeable"] = not r["blockers"]
                 results.append(r)
         except GeoBlocked as exc:
             send_telegram(f"⚠️ <b>Scan blocked</b>\n{exc}")
