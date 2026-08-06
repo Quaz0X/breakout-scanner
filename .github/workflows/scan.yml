@@ -1,18 +1,22 @@
 name: Intraday breakout scan
 
 on:
+  # Kept as a fallback. GitHub's scheduler has been delivering ~3 runs a
+  # day against this hourly cron, which is why the external trigger below
+  # exists. If GitHub ever becomes reliable again this still works.
   schedule:
-    # Top of every hour. This is the cadence that was working before -
-    # do not change it while diagnosing scheduling problems.
     - cron: "0 * * * *"
-  workflow_dispatch:        # manual run from the Actions tab
+
+  # The reliable path. An external cron service POSTs to the GitHub API
+  # and fires this immediately, bypassing GitHub's own queue entirely.
+  repository_dispatch:
+    types: [run-scan]
+
+  # Manual run from the Actions tab.
+  workflow_dispatch:
 
 concurrency:
   group: breakout-scan
-  # MUST stay false. With cancel-in-progress: true, any manual run you
-  # trigger also kills scheduled runs sitting in GitHub's queue - and
-  # scheduled runs queue routinely under load. That is what was eating
-  # the hourly runs.
   cancel-in-progress: false
 
 jobs:
@@ -42,13 +46,27 @@ jobs:
           MIN_QUOTE_VOLUME: "10000000"   # min 24h volume in USDT
           MAX_SPREAD_PCT: "0.12"         # reject anything wider
           MIN_COST_EDGE: "4.0"           # expected move / round-trip cost
+          MAX_RISK_PCT: "4.0"            # max distance to stop
+          MIN_NEAR_DEPTH: "25000"        # bid depth within 0.5% of price
+          MAX_ATR_PCT: "3.0"             # per-15m volatility ceiling
 
-          # Set to 0.075 if you pay fees in BNB, lower still for VIP tiers.
-          # Several coins are currently rejected at 3.5-3.9x and would
-          # qualify at a lower fee assumption.
+          # Set to 0.075 if you pay Binance fees in BNB.
           TAKER_FEE_PCT: "0.10"
 
-          # 12 x 15m = 3 hour expected hold
-          HOLD_CANDLES: "12"
+          HOLD_CANDLES: "12"             # 12 x 15m = 3h expected hold
           SHORTLIST_SIZE: "25"
         run: python scanner.py
+
+      # Fires whether the scan succeeded or failed, so a silent week is
+      # immediately visible rather than something you discover days later.
+      - name: Heartbeat
+        if: always()
+        env:
+          TG_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TG_CHAT: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          curl -s -X POST \
+            "https://api.telegram.org/bot$TG_TOKEN/sendMessage" \
+            -d chat_id="$TG_CHAT" \
+            -d text="ping: run finished (trigger=${{ github.event_name }}, status=${{ job.status }})" \
+            > /dev/null
