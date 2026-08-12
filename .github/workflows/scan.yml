@@ -1,62 +1,61 @@
 name: Intraday breakout scan
-
 on:
   # Kept as a fallback. GitHub's scheduler has been delivering ~3 runs a
   # day against this hourly cron, which is why the external trigger below
   # exists. If GitHub ever becomes reliable again this still works.
+  #
+  # Changed from "0 * * * *" to ":07". Firing exactly on the hour meant
+  # the live 15m candle was seconds old on every run. The scanner now
+  # excludes the live candle from all indicators so this no longer
+  # corrupts anything, but running a few minutes in still gives a more
+  # useful "live candle pace" reading for entry timing.
   schedule:
-    - cron: "0 * * * *"
-
+    - cron: "7 * * * *"
   # The reliable path. An external cron service POSTs to the GitHub API
   # and fires this immediately, bypassing GitHub's own queue entirely.
   repository_dispatch:
     types: [run-scan]
-
   # Manual run from the Actions tab.
   workflow_dispatch:
-
 concurrency:
   group: breakout-scan
   cancel-in-progress: false
-
 jobs:
   scan:
     runs-on: ubuntu-latest
     timeout-minutes: 12
-
     steps:
       - name: Check out repo
         uses: actions/checkout@v4
-
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-
       - name: Install dependencies
         run: pip install requests
-
       - name: Run scan
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           BINANCE_BASE_URL: ${{ vars.BINANCE_BASE_URL || 'https://api.binance.com' }}
-
+          BINANCE_FAPI_URL: ${{ vars.BINANCE_FAPI_URL || 'https://fapi.binance.com' }}
           # --- liquidity and cost gates -------------------------------
           MIN_QUOTE_VOLUME: "10000000"   # min 24h volume in USDT
           MAX_SPREAD_PCT: "0.12"         # reject anything wider
           MIN_COST_EDGE: "4.0"           # expected move / round-trip cost
+          MIN_RR: "1.5"                  # expected move / stop distance
           MAX_RISK_PCT: "4.0"            # max distance to stop
           MIN_NEAR_DEPTH: "25000"        # bid depth within 0.5% of price
           MAX_ATR_PCT: "3.0"             # per-15m volatility ceiling
-
           # Set to 0.075 if you pay Binance fees in BNB.
           TAKER_FEE_PCT: "0.10"
-
           HOLD_CANDLES: "12"             # 12 x 15m = 3h expected hold
           SHORTLIST_SIZE: "25"
+          # "anticipate" = score highest just BELOW an untested level.
+          # "confirm"    = score highest just ABOVE one that has broken.
+          BREAKOUT_MODE: "anticipate"
+          WORKERS: "5"
         run: python scanner.py
-
       # Fires whether the scan succeeded or failed, so a silent week is
       # immediately visible rather than something you discover days later.
       - name: Heartbeat
