@@ -1,71 +1,82 @@
-name: Intraday breakout scan
+name: Scalp scanner
+
 on:
-  # Kept as a fallback. GitHub's scheduler has been delivering ~3 runs a
-  # day against this hourly cron, which is why the external trigger below
-  # exists. If GitHub ever becomes reliable again this still works.
-  #
-  # Changed from "0 * * * *" to ":07". Firing exactly on the hour meant
-  # the live 15m candle was seconds old on every run. The scanner now
-  # excludes the live candle from all indicators so this no longer
-  # corrupts anything, but running a few minutes in still gives a more
-  # useful "live candle pace" reading for entry timing.
+  # GitHub's own cron is unreliable on free repos — kept only as a backup.
+  # cron-job.org fires the repository_dispatch below on the real schedule.
   schedule:
-    - cron: "7 * * * *"
-  # The reliable path. An external cron service POSTs to the GitHub API
-  # and fires this immediately, bypassing GitHub's own queue entirely.
+    - cron: "*/30 * * * *"
   repository_dispatch:
     types: [run-scan]
-  # Manual run from the Actions tab.
   workflow_dispatch:
+
 concurrency:
-  group: breakout-scan
+  group: scalp-scanner
   cancel-in-progress: false
+
 jobs:
   scan:
     runs-on: ubuntu-latest
     timeout-minutes: 12
+
     steps:
-      - name: Check out repo
+      - name: Checkout
         uses: actions/checkout@v4
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+
       - name: Install dependencies
-        run: pip install requests
+        run: pip install --no-cache-dir requests
+
       - name: Run scan
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          BINANCE_BASE_URL: ${{ vars.BINANCE_BASE_URL || 'https://api.binance.com' }}
-          BINANCE_FAPI_URL: ${{ vars.BINANCE_FAPI_URL || 'https://fapi.binance.com' }}
-          # --- liquidity and cost gates -------------------------------
-          MIN_QUOTE_VOLUME: "10000000"   # min 24h volume in USDT
-          MAX_SPREAD_PCT: "0.12"         # reject anything wider
-          MIN_COST_EDGE: "4.0"           # expected move / round-trip cost
-          MIN_RR: "1.5"                  # expected move / stop distance
-          MAX_RISK_PCT: "4.0"            # max distance to stop
-          MIN_NEAR_DEPTH: "25000"        # bid depth within 0.5% of price
-          MAX_ATR_PCT: "3.0"             # per-15m volatility ceiling
+
+          # --- horizon -------------------------------------------------
+          # 6 candles x 15m = 90 minutes. This single number controls how
+          # generous every cost-edge figure is. Raising it to get more
+          # alerts is self-deception, not tuning.
+          HOLD_CANDLES: "6"
+          INTERVAL: "15m"
+
+          # --- costs ---------------------------------------------------
           # Set to 0.075 if you pay Binance fees in BNB.
           TAKER_FEE_PCT: "0.10"
-          HOLD_CANDLES: "12"             # 12 x 15m = 3h expected hold
+          MIN_COST_EDGE: "4.0"
+
+          # --- hard gates ----------------------------------------------
+          MIN_QUOTE_VOL_24H: "10000000"
+          MAX_SPREAD_PCT: "0.12"
+          MIN_NEAR_DEPTH_USD: "25000"
+          MIN_ATR_PCT: "0.15"
+          MAX_ATR_PCT: "1.50"
+          MIN_RVOL: "0.80"
+          MAX_STOP_PCT: "1.50"
+          MAX_TRIGGER_DIST_PCT: "1.20"
+
+          # --- scope ---------------------------------------------------
           SHORTLIST_SIZE: "25"
-          # "anticipate" = score highest just BELOW an untested level.
-          # "confirm"    = score highest just ABOVE one that has broken.
-          BREAKOUT_MODE: "anticipate"
-          WORKERS: "5"
+          MAX_REPORTED: "5"
+          RES_LOOKBACK_FAR: "24"
+          RES_LOOKBACK_NEAR: "6"
+
+          # --- geo fallback --------------------------------------------
+          # GitHub runners are US-based and api.binance.com returns 451.
+          # data-api.binance.vision is tried first and usually answers.
+          BINANCE_HOSTS: "https://data-api.binance.vision,https://api-gcp.binance.com,https://api.binance.com"
         run: python scanner.py
-      # Fires whether the scan succeeded or failed, so a silent week is
-      # immediately visible rather than something you discover days later.
+
       - name: Heartbeat
         if: always()
         env:
-          TG_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TG_CHAT: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
           curl -s -X POST \
-            "https://api.telegram.org/bot$TG_TOKEN/sendMessage" \
-            -d chat_id="$TG_CHAT" \
-            -d text="ping: run finished (trigger=${{ github.event_name }}, status=${{ job.status }})" \
+            "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/sendMessage" \
+            -d chat_id="$TELEGRAM_CHAT_ID" \
+            -d text="✅ scan ran (${{ github.event_name }}) — ${{ job.status }}" \
             > /dev/null
